@@ -99,6 +99,8 @@
   .popup .pcls{font-size:13px; color:#cfe0f7; margin-top:8px; word-break:keep-all}
   .popup .rbadge2{display:inline-block; background:var(--accent); color:#fff; font-weight:700; font-size:13px; padding:3px 12px; border-radius:20px; margin-bottom:10px}
 
+  .popupCatcher{position:fixed; inset:0; z-index:150; pointer-events:none; background:transparent}
+  .popupCatcher.active{pointer-events:auto}
   .toast{position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#22314a; border:1px solid var(--line); color:var(--text); padding:11px 18px; border-radius:12px; z-index:300; font-size:14px; opacity:0; transition:.2s; pointer-events:none}
   .toast.show{opacity:1}
   .spinner{width:15px;height:15px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;display:inline-block}
@@ -108,6 +110,15 @@
     th.hidem,td.hidem{display:none}
     .tag-cls{max-width:130px}
   }
+  .camBanner{
+    max-width:1100px; margin:10px auto 0; padding:11px 16px; border-radius:12px;
+    font-size:13px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  }
+  .camBanner.info{background:#1b2a3f; border:1px solid var(--accent); color:#cfe0f7}
+  .camBanner.warn{background:#3a2a15; border:1px solid var(--warn); color:#ffdca0}
+  .camBanner.ok{background:#12321f; border:1px solid var(--accent2); color:#b6f2d4}
+  .camBanner button{margin-left:auto}
+  .taphint{font-size:12px; color:#cfe0f7; margin-top:10px; opacity:.85}
 </style>
 </head>
 <body>
@@ -117,6 +128,7 @@
   <button class="btn" id="importBtn">📁 엑셀 불러오기</button>
   <input type="file" id="fileInput" accept=".xlsx,.xls" style="display:none">
 </header>
+<div class="camBanner" id="camBanner" style="display:none"></div>
 
 <div class="wrap">
   <div class="stats" id="stats"></div>
@@ -151,6 +163,7 @@
   </div>
 </div>
 
+<div class="popupCatcher" id="popupCatcher"></div>
 <div class="popup" id="popup"></div>
 <div class="toast" id="toast"></div>
 
@@ -325,10 +338,56 @@ $('#stopOcr').addEventListener('click',stopOCR);
 $('#switchCam').addEventListener('click',async()=>{facing=facing==='environment'?'user':'environment';await openCamera();});
 $('#clearLog').addEventListener('click',()=>{$('#logbody').innerHTML='<div class="emptylog">기록이 지워졌습니다. 다시 명찰을 비춰주세요.</div>';logCount=0;updLogCount();for(const k in seenAt)delete seenAt[k];});
 
+/* --- cross-browser camera support (Chrome, Samsung Internet, Whale, Firefox 등) --- */
+function hasCameraAPI(){
+  return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+}
+function cameraErrorMessage(e){
+  const n=e && e.name;
+  if(n==='NotAllowedError'||n==='PermissionDeniedError') return '카메라 권한이 거부되었습니다. 주소창의 자물쇠(또는 사이트 설정) 메뉴에서 카메라 권한을 허용한 뒤 새로고침해 주세요.';
+  if(n==='NotFoundError'||n==='DevicesNotFoundError') return '사용 가능한 카메라를 찾지 못했습니다.';
+  if(n==='NotReadableError'||n==='TrackStartError') return '다른 앱이 카메라를 사용 중입니다. 카메라를 쓰는 다른 앱을 종료한 뒤 다시 시도해 주세요.';
+  if(n==='SecurityError') return '보안 정책으로 카메라 접근이 차단되었습니다. https 주소로 접속했는지 확인해 주세요.';
+  if(n==='OverconstrainedError'||n==='ConstraintNotSatisfiedError') return '요청한 카메라 옵션을 지원하지 않습니다.';
+  return '카메라를 열 수 없습니다' + (e&&e.message?(': '+e.message):'.');
+}
+function setCamBanner(kind, html, withRetry){
+  const b=$('#camBanner');
+  if(!kind){ b.style.display='none'; b.innerHTML=''; return; }
+  b.className='camBanner '+kind;
+  b.style.display='flex';
+  b.innerHTML='<span>'+html+'</span>';
+  if(withRetry){
+    const btn=document.createElement('button');
+    btn.className='btn sm'; btn.textContent='권한 다시 요청';
+    btn.onclick=requestCameraPermission;
+    b.appendChild(btn);
+  }
+}
+// 페이지 접속 시 곧바로 카메라 권한을 요청한다 (Chrome / 삼성인터넷 / 웨일 / Firefox 등에서 동일하게 동작)
+async function requestCameraPermission(){
+  if(!hasCameraAPI()){
+    setCamBanner('warn','⚠️ 이 브라우저 또는 접속 방식(예: 파일을 직접 열기)에서는 카메라를 사용할 수 없습니다. https 주소로, 최신 브라우저에서 접속해 주세요.');
+    return false;
+  }
+  setCamBanner('info','<span class="spinner"></span> 카메라 권한을 확인하고 있습니다…');
+  try{
+    const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});
+    s.getTracks().forEach(t=>t.stop());
+    setCamBanner('ok','✅ 카메라 사용 준비가 완료되었습니다. 상단 "OCR 시작" 버튼을 눌러주세요.');
+    setTimeout(()=>setCamBanner(null),3000);
+    return true;
+  }catch(e){
+    setCamBanner('warn','⚠️ '+cameraErrorMessage(e), true);
+    return false;
+  }
+}
+
 async function startOCR(){
   $('#overlay').classList.add('on');
   setStatus('카메라 준비 중…');
-  try{ await openCamera(); }catch(e){ setStatus('카메라 접근 실패'); toast('카메라를 열 수 없습니다: '+e.message); return; }
+  if(!hasCameraAPI()){ setStatus('카메라 사용 불가'); toast('이 브라우저에서는 카메라를 사용할 수 없습니다.'); return; }
+  try{ await openCamera(); }catch(e){ setStatus('카메라 접근 실패'); toast(cameraErrorMessage(e)); setCamBanner('warn','⚠️ '+cameraErrorMessage(e), true); return; }
   if(!worker){
     setStatus('한글 인식 엔진 로딩 중… (최초 1회, 수십초 소요)');
     try{
@@ -349,7 +408,17 @@ async function startOCR(){
 }
 async function openCamera(){
   if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
-  stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:facing},width:{ideal:1280},height:{ideal:720}},audio:false});
+  const primary={video:{facingMode:{ideal:facing},width:{ideal:1280},height:{ideal:720}},audio:false};
+  try{
+    stream=await navigator.mediaDevices.getUserMedia(primary);
+  }catch(e){
+    // 일부 브라우저/기기는 위 옵션 조합을 지원하지 않을 수 있어, 최소 조건으로 한 번 더 시도한다
+    if(e.name==='OverconstrainedError'||e.name==='ConstraintNotSatisfiedError'){
+      stream=await navigator.mediaDevices.getUserMedia({video:true,audio:false});
+    }else{
+      throw e;
+    }
+  }
   const v=$('#video'); v.srcObject=stream; await v.play().catch(()=>{});
   setTimeout(positionGuide,300);
 }
@@ -398,6 +467,7 @@ function grabFrame(){
 }
 async function scanLoop(){
   while(scanning){
+    if(popupOpen){ await new Promise(r=>setTimeout(r,150)); continue; } // 팝업이 떠 있는 동안은 인식을 잠시 멈춘다
     const c=grabFrame();
     if(c && worker){
       try{
@@ -431,6 +501,17 @@ function handleOCR(text){
 function setStatus(s){ $('#ocrstatus').innerHTML=s; }
 
 /* popup */
+const isMobile = matchMedia('(pointer: coarse)').matches || ('ontouchstart' in window) || (navigator.maxTouchPoints>0);
+let popupOpen=false;
+function openPopupCatcher(){ popupOpen=true; $('#popupCatcher').classList.add('active'); }
+function dismissPopup(){
+  $('#popup').classList.remove('show');
+  $('#popupCatcher').classList.remove('active');
+  popupOpen=false;
+}
+$('#popupCatcher').addEventListener('click',dismissPopup);
+const tapHint = isMobile ? '<div class="taphint">화면을 터치하면 닫힙니다</div>' : '';
+
 function showPopup(p,confident,fuzzy){
   const el=$('#popup');
   el.className='popup'+(confident?'':' warn');
@@ -443,20 +524,28 @@ function showPopup(p,confident,fuzzy){
     <div class="pschool">${esc(p.school)}${p.subj?' · '+esc(p.subj):''}</div>
     <div class="pbig">${esc(p.jo)}</div>
     <div class="pcls">${esc(p.cls||p.full)}</div>
-    ${note?`<div class="prow" style="color:var(--warn);font-size:12px;margin-top:8px">${note}</div>`:''}`;
+    ${note?`<div class="prow" style="color:var(--warn);font-size:12px;margin-top:8px">${note}</div>`:''}
+    ${tapHint}`;
   requestAnimationFrame(()=>el.classList.add('show'));
   clearTimeout(el._t);
-  el._t=setTimeout(()=>el.classList.remove('show'),1000); // 1초 유지
+  openPopupCatcher();
+  if(!isMobile){
+    el._t=setTimeout(dismissPopup,1000); // 데스크톱: 1초 유지 후 자동으로 사라짐
+  } // 모바일: 화면을 터치할 때까지 유지
 }
 function showPopupAmbiguous(list){
   const el=$('#popup'); el.className='popup warn';
   el.innerHTML=`<div class="rbadge2" style="background:var(--warn);color:#1a1a1a">동명이인 ${list.length}명</div>
     <div class="pname" style="font-size:20px">${esc(list[0].name)}</div>
     <div class="pschool">소속으로 직접 확인하세요</div>
-    ${list.map(p=>`<div class="prow"><span class="jochip">${esc(p.jo)}</span> ${esc(p.school)} <span style="color:var(--muted)">· ${esc(p.round||'')}</span></div>`).join('')}`;
+    ${list.map(p=>`<div class="prow"><span class="jochip">${esc(p.jo)}</span> ${esc(p.school)} <span style="color:var(--muted)">· ${esc(p.round||'')}</span></div>`).join('')}
+    ${tapHint}`;
   requestAnimationFrame(()=>el.classList.add('show'));
   clearTimeout(el._t);
-  el._t=setTimeout(()=>el.classList.remove('show'),1500);
+  openPopupCatcher();
+  if(!isMobile){
+    el._t=setTimeout(dismissPopup,1500); // 데스크톱: 1.5초 유지 후 자동으로 사라짐
+  } // 모바일: 화면을 터치할 때까지 유지
 }
 
 /* log */
@@ -481,11 +570,12 @@ function stopOCR(){
   if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
   $('#video').srcObject=null;
   $('#overlay').classList.remove('on');
-  $('#popup').classList.remove('show');
+  dismissPopup();
 }
 
 /* init */
 renderAll();
+requestCameraPermission();
 </script>
 </body>
 </html>
