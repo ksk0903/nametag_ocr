@@ -261,7 +261,7 @@ function matchTag(ocrText){
   const t=norm(ocrText);
   if(t.length<2) return null;
   const cand=PEOPLE.filter(p=>{const n=norm(p.name); return n.length>=2 && t.includes(n);});
-  if(cand.length===0) return null;
+  if(cand.length===0) return fuzzyMatch(t);
   const withSchool=cand.filter(p=>{const s=norm(p.school); return s.length>=2 && t.includes(s);});
   if(withSchool.length===1) return {list:withSchool,confident:true};
   if(withSchool.length>1)  return {list:withSchool,confident:false};
@@ -269,6 +269,51 @@ function matchTag(ocrText){
   return {list:cand,confident:false};
 }
 function keyOf(p){return p.name+'|'+p.school+'|'+p.jo+'|'+p.full;}
+
+// --- fuzzy fallback: tolerates 1-2 OCR misreadings in the name ---
+function lev(a,b){
+  const m=a.length,n=b.length;
+  if(m===0) return n; if(n===0) return m;
+  let prev=new Array(n+1); for(let j=0;j<=n;j++) prev[j]=j;
+  for(let i=1;i<=m;i++){
+    const cur=[i];
+    for(let j=1;j<=n;j++){
+      cur[j]=Math.min(prev[j]+1, cur[j-1]+1, prev[j-1]+(a[i-1]===b[j-1]?0:1));
+    }
+    prev=cur;
+  }
+  return prev[n];
+}
+function bestWindowScore(hay,needle){
+  if(!needle) return 0;
+  let best=0;
+  const nl=needle.length;
+  for(let len=Math.max(1,nl-1); len<=nl+1; len++){
+    for(let i=0;i+len<=hay.length; i++){
+      const sub=hay.substr(i,len);
+      const d=lev(sub,needle);
+      const sc=1-d/Math.max(sub.length,nl);
+      if(sc>best) best=sc;
+    }
+  }
+  return best;
+}
+function fuzzyMatch(t){
+  if(t.length<2) return null;
+  let best=null, bestScore=0;
+  for(const p of PEOPLE){
+    const n=norm(p.name);
+    if(n.length<2) continue;
+    const scoreName=bestWindowScore(t,n);
+    if(scoreName<0.6) continue; // name must be at least ~60% matched
+    const s=norm(p.school);
+    const scoreSchool=s.length>=2?bestWindowScore(t,s):0;
+    const score=scoreName+scoreSchool*0.4;
+    if(score>bestScore){bestScore=score;best=p;}
+  }
+  if(!best) return null;
+  return {list:[best],confident:false,fuzzy:true};
+}
 
 /* ============ OCR camera ============ */
 let stream=null, worker=null, scanning=false, facing='environment';
@@ -288,6 +333,13 @@ async function startOCR(){
     setStatus('한글 인식 엔진 로딩 중… (최초 1회, 수십초 소요)');
     try{
       worker=await Tesseract.createWorker('kor+eng');
+      // name tags are a small block of short lines, not a full page —
+      // this mode + these params make recognition both faster and more accurate
+      await worker.setParameters({
+        tessedit_pageseg_mode:'6',        // assume a single uniform block of text
+        preserve_interword_spaces:'1',
+        tessedit_ocr_engine_mode:'1'      // LSTM only (skip slower legacy engine)
+      });
     }catch(e){ setStatus('엔진 로딩 실패'); toast('OCR 엔진 로딩 실패 (인터넷 연결 확인)'); return; }
   }
   positionGuide();
@@ -304,7 +356,7 @@ async function openCamera(){
 function positionGuide(){
   const v=$('#video'), g=$('#guide');
   const vw=v.clientWidth, vh=v.clientHeight;
-  const gw=Math.min(vw*0.95,820), gh=Math.min(vh*0.72,460);
+  const gw=Math.min(vw*0.85,640), gh=Math.min(vh*0.5,320);
   g.style.width=gw+'px'; g.style.height=gh+'px';
   g.style.left=(vw-gw)/2+'px'; g.style.top=(vh-gh)/2+'px';
 }
@@ -318,15 +370,27 @@ function grabFrame(){
   const sy=(grect.top-vrect.top)/vrect.height*v.videoHeight;
   const sw=grect.width/vrect.width*v.videoWidth;
   const sh=grect.height/vrect.height*v.videoHeight;
-  const scale=2; // upscale for better OCR
-  const c=document.createElement('canvas'); c.width=sw*scale; c.height=sh*scale;
+  if(sw<10||sh<10) return null;
+  // cap output width regardless of guide box size — this is what keeps recognize() fast
+  const TARGET_W=760;
+  const scale=Math.max(1, Math.min(TARGET_W/sw, 2.2));
+  const c=document.createElement('canvas');
+  c.width=Math.round(sw*scale); c.height=Math.round(sh*scale);
   const ctx=c.getContext('2d');
+  ctx.imageSmoothingEnabled=true;
   ctx.drawImage(v,sx,sy,sw,sh,0,0,c.width,c.height);
-  // simple contrast boost + grayscale
   const img=ctx.getImageData(0,0,c.width,c.height), d=img.data;
-  for(let i=0;i<d.length;i+=4){
-    let y=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
-    y=y<115?y*0.6:Math.min(255,y*1.25);
+  // grayscale + auto contrast stretch (adapts to actual lighting instead of a fixed threshold)
+  const n=d.length/4; let lo=255,hi=0;
+  const gray=new Uint8ClampedArray(n);
+  for(let i=0,j=0;i<d.length;i+=4,j++){
+    const y=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
+    gray[j]=y; if(y<lo)lo=y; if(y>hi)hi=y;
+  }
+  const range=Math.max(20,hi-lo); // guard against near-flat frames
+  for(let i=0,j=0;i<d.length;i+=4,j++){
+    let y=(gray[j]-lo)/range*255;
+    y=Math.pow(Math.max(0,Math.min(255,y))/255,0.85)*255; // mild gamma to pop dark text
     d[i]=d[i+1]=d[i+2]=y;
   }
   ctx.putImageData(img,0,0);
@@ -341,7 +405,8 @@ async function scanLoop(){
         handleOCR(data.text||'');
       }catch(e){ /* ignore frame */ }
     }
-    await new Promise(r=>setTimeout(r,1200));
+    // recognize() itself takes ~0.3-1.5s; a short extra gap is enough to avoid pegging the CPU
+    await new Promise(r=>setTimeout(r,250));
   }
 }
 let busyPopup=false;
@@ -360,22 +425,25 @@ function handleOCR(text){
   }
   if(seenAt[k] && now-seenAt[k]<4000){ setStatus('인식됨: '+p.name); return; }
   seenAt[k]=now;
-  showPopup(p,m.confident);
+  showPopup(p,m.confident,m.fuzzy);
   addLog(p,false);
 }
 function setStatus(s){ $('#ocrstatus').innerHTML=s; }
 
 /* popup */
-function showPopup(p,confident){
+function showPopup(p,confident,fuzzy){
   const el=$('#popup');
   el.className='popup'+(confident?'':' warn');
+  let note='';
+  if(fuzzy) note='※ 글자가 흐릿하게 인식됨 · 유사 매칭 결과이니 확인해 주세요';
+  else if(!confident) note='※ 소속 미확인 · 이름만 일치';
   el.innerHTML=`
     ${p.round?`<div class="rbadge2">${esc(p.round)}</div>`:''}
     <div class="pname">${esc(p.name)}</div>
     <div class="pschool">${esc(p.school)}${p.subj?' · '+esc(p.subj):''}</div>
     <div class="pbig">${esc(p.jo)}</div>
     <div class="pcls">${esc(p.cls||p.full)}</div>
-    ${confident?'':'<div class="prow" style="color:var(--warn);font-size:12px;margin-top:8px">※ 소속 미확인 · 이름만 일치</div>'}`;
+    ${note?`<div class="prow" style="color:var(--warn);font-size:12px;margin-top:8px">${note}</div>`:''}`;
   requestAnimationFrame(()=>el.classList.add('show'));
   clearTimeout(el._t);
   el._t=setTimeout(()=>el.classList.remove('show'),1000); // 1초 유지
